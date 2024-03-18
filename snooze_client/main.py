@@ -69,7 +69,19 @@ def authenticated(method):
         except jwt.DecodeError:
             log.warn("Invalid JWT token found at %s. Discarding.", TOKEN_FILE)
             self.login()
-        return method(self, *args, **kwargs)
+        # return method(self, *args, **kwargs)
+        raise_deepth = kwargs.get('raise_deepth', 0)
+        try:
+            kwargs.pop('raise_deepth', None)
+            return method(self, *args, **kwargs)
+        except Exception as e:
+            log.warn("Exception raised by method: %s", e)
+            kwargs['raise_deepth'] = raise_deepth + 1
+            if kwargs['raise_deepth'] < 5:
+                return wrapper(self, *args, **kwargs)
+            else:
+                kwargs.pop('raise_deepth', None)
+                return method(self, *args, **kwargs)
     return wrapper
 
 def get_token():
@@ -322,6 +334,56 @@ class Snooze(object):
             resp.raise_for_status()
             responses.append(resp.json())
         return merge_responses(responses).get('data')
+    
+    @authenticated
+    def one_page_fetch(self, url_postfix, pagenb, perpage, search=None, ql=None):
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        if search:
+            params = {
+                's': json.dumps(search),
+            }
+        elif ql:
+            params = {
+                'ql': ql,
+            }
+        else:
+            params = {
+                's': [],
+            }
+        params.update({
+            'perpage': perpage,
+            'pagenb': pagenb,
+            'asc': True,
+            'orderby': 'tree_order'
+        })
+        resp = requests.get("{}/api/{}".format(self.server, url_postfix), verify=self.ca, headers=headers, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def pages_fetch(self, url_postfix, search=None, ql=None):
+        '''
+        Return a list of items matching the search.
+        If `search` or `ql` is not precised, the default search will be `[]` (everything).
+
+        Args:
+            search (list): A list representing the search. Example: ["=", "comment", "Created by snooze API"]
+            ql (str): A item query language string. It will be translated by the server into a
+                search (list). Useful for human interfaces.
+        Returns:
+            list: List of dictionaries representing the items matching the search
+        '''
+        pagenb = 1
+        perpage = 20
+        total_count = -1
+        resp_pages = []
+        while total_count == -1 or (pagenb - 1) * perpage < total_count:
+            resp = self.one_page_fetch(url_postfix, pagenb, perpage, search, ql)
+            resp_pages += resp.get('data')
+            total_count = resp.get('count')
+            pagenb += 1
+        return resp_pages
 
     @authenticated
     def snooze(self, name, condition=None, ql=None, time_constraint={}, comment=None):
@@ -391,7 +453,344 @@ class Snooze(object):
             myfilters.append(myfilter)
         responses = []
         for filter_block in get_chunks(myfilters, 10):
-            resp = requests.post("{}/api/snooze".format(self.server), verify=self.ca, headers=headers, json=filter_block, timeout=self.timeout)
+            try:
+                resp = requests.post("{}/api/snooze".format(self.server), verify=self.ca, headers=headers, json=filter_block, timeout=self.timeout)
+                resp.raise_for_status()
+            except Exception as e:
+                log.info(f"snooze batch error: {filter_block}")
+                raise e
+            responses.append(resp.json())
+        return merge_responses(responses).get('data')
+    
+    def fetch_snoozes(self, search=None, ql=None):
+        '''
+        Return a list of snoozes matching the search.
+        If `search` or `ql` is not precised, the default search will be `[]` (everything).
+
+        Args:
+            search (list): A list representing the search. Example: ["=", "comment", "Created by snooze API"]
+            ql (str): A snooze query language string. It will be translated by the server into a
+                search (list). Useful for human interfaces.
+        Returns:
+            list: List of dictionaries representing the snoozes matching the search
+        '''
+        return self.pages_fetch('snooze', search, ql)
+    
+    @authenticated
+    def delete_snoozes(self, uids=[]):
+        '''
+        Delete a snoozes list.
+
+        Args:
+            uids (list): A list of snooze uids to delete. Example: ["5a463355-ed5c-4207-9530-7f21d32ddc7a", "e016309c-67ce-41b1-94d7-bc39370e5da2"]
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        params = {
+            "s": json.dumps(["OR"] + [["=", "uid", uid] for uid in uids])
+        }
+        resp = requests.delete("{}/api/snooze".format(self.server), verify=self.ca, headers=headers, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+    
+    @authenticated
+    def action_to_mail(self, name, mail_obj={"to": "null@null.com"}, comment=None):
+        '''
+        Create a action entry.
+
+        Args:
+            name (str): Name of the action entry.
+            mail_obj (dict): mail destination information.
+            comment (str): A comment associated with the action entry.
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        if not comment:
+            comment = "Created by snooze API"
+        params = {
+            "name": "[{}] {}".format(self.app_name, name),
+            "action":
+                {
+                    "selected": "mail",
+                    "subcontent":
+                        {
+                            "host": mail_obj.get("host", "localhost"),
+                            "port": mail_obj.get("port", 25),
+                            "from": mail_obj.get("from", ""),
+                            "to": mail_obj.get("to", "null@null.com"),
+                            "priority": 3,
+                            "subject": "Alert: {{ host }}",
+                            "message": "Message: {{ message }}",
+                            "type": "html",
+                            "batch_timer": 10,
+                            "batch_maxsize": 100
+                        }
+                },
+            "comment": comment,
+        }
+        resp = requests.post("{}/api/action".format(self.server), verify=self.ca, headers=headers, json=[params], timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json().get('data')
+    
+    @authenticated
+    def action_batch(self, obj_ls):
+        '''
+        Create a action entry.
+
+        Args:
+			actions(dict, list): actions to write
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        if not isinstance(obj_ls, list):
+            obj_ls = [obj_ls]
+        myobj_ls = []
+        for obj in obj_ls:
+            myobj = {
+                "name": "[{}] {}".format(self.app_name, obj['name']),
+                "action": {
+                    "selected": "mail",
+                    "subcontent": {
+                        "host": obj.get("host", "localhost"),
+                        "port": obj.get("port", 25),
+                        "from": obj.get("from", ""),
+                        "to": obj.get("to", "null@null.com"),
+                        "priority": 3,
+                        "subject": "Alert: {{ host }}",
+                        "message": "Message: {{ message }}",
+                        "type": "html",
+                        "batch_timer": 10,
+                        "batch_maxsize": 100
+                        }
+                },
+                "comment": obj.get('comment', "Created by snooze API"),
+            }
+            myobj_ls.append(myobj)
+        responses = []
+        for myobj_block in get_chunks(myobj_ls, 10):
+            resp = requests.post("{}/api/action".format(self.server), verify=self.ca, headers=headers, json=myobj_block, timeout=self.timeout)
             resp.raise_for_status()
             responses.append(resp.json())
         return merge_responses(responses).get('data')
+    
+    def fetch_actions(self, search=None, ql=None):
+        '''
+        Return a list of actions matching the search.
+        If `search` or `ql` is not precised, the default search will be `[]` (everything).
+
+        Args:
+            search (list): A list representing the search. Example: ["=", "comment", "Created by snooze API"]
+            ql (str): A snooze query language string. It will be translated by the server into a
+                search (list). Useful for human interfaces.
+        Returns:
+            list: List of dictionaries representing the actions matching the search
+        '''
+        return self.pages_fetch('action', search, ql)
+    
+    @authenticated
+    def delete_actions(self, uids=[]):
+        '''
+        Delete a actions list.
+
+        Args:
+            uids (list): A list of action uids to delete. Example: ["5a463355-ed5c-4207-9530-7f21d32ddc7a", "e016309c-67ce-41b1-94d7-bc39370e5da2"]
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        params = {
+            "s": json.dumps(["OR"] + [["=", "uid", uid] for uid in uids])
+        }
+        resp = requests.delete("{}/api/action".format(self.server), verify=self.ca, headers=headers, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+    
+    @authenticated
+    def notification(self, name, notifi_obj, comment=None):
+        '''
+        Create a notification.
+
+        Args:
+            name (str): Name of the notification.
+            notifi_obj (dict): notification information.
+            comment (str): A comment associated with the notification.
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        if not comment:
+            comment = "Created by snooze API"
+        # params = {
+        #     "name": "[{}] {}".format(self.app_name, name),
+        #     "actions": ["[snooze_client] test_mail_1"],
+        #     "time_constraints": {
+        #         "datetime":[{"from":"2024-03-01T14:52+09:00","until":"2024-03-30T15:52+09:00"}],
+        #         "weekdays":[{"weekdays":[2,3,4,5]}]
+        #     },
+        #     "comment":"",
+        #     "frequency":{"total":1,"delay":0,"every":0},
+        #     "condition":["CONTAINS","raw","host7.example.com"]
+        # }
+        params = {
+            "name": "[{}] {}".format(self.app_name, name),
+            "actions": notifi_obj.get("actions", ["[snooze_client] default_mail"]),
+            "time_constraints": notifi_obj.get("time_constraints", {}),
+            "comment": comment,
+            "frequency": {"total":1,"delay":0,"every":0},
+            "condition": notifi_obj.get("condition", []),
+        }
+        resp = requests.post("{}/api/notification".format(self.server), verify=self.ca, headers=headers, json=[params], timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json().get('data')
+    
+    @authenticated
+    def notification_batch(self, obj_ls):
+        '''
+        Create a notification entry.
+
+        Args:
+			notifications(dict, list): notifications to write
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        if not isinstance(obj_ls, list):
+            obj_ls = [obj_ls]
+        myobj_ls = []
+        for obj in obj_ls:
+            myobj = {
+                "name": "[{}] {}".format(self.app_name, obj['name']),
+                "actions": obj.get("actions", ["[snooze_client] default_mail"]),
+                "time_constraints": obj.get("time_constraints", {}),
+                "comment": obj.get('comment', "Created by snooze API"),
+                "frequency": {"total":1,"delay":0,"every":0},
+                "condition": obj.get("condition", []),
+            }
+            myobj_ls.append(myobj)
+        responses = []
+        for myobj_block in get_chunks(myobj_ls, 10):
+            resp = requests.post("{}/api/notification".format(self.server), verify=self.ca, headers=headers, json=myobj_block, timeout=self.timeout)
+            resp.raise_for_status()
+            responses.append(resp.json())
+        return merge_responses(responses).get('data')
+
+    def fetch_notifications(self, search=None, ql=None):
+        '''
+        Return a list of notifications matching the search.
+        If `search` or `ql` is not precised, the default search will be `[]` (everything).
+
+        Args:
+            search (list): A list representing the search. Example: ["=", "comment", "Created by snooze API"]
+            ql (str): A notification query language string. It will be translated by the server into a
+                search (list). Useful for human interfaces.
+        Returns:
+            list: List of dictionaries representing the notifications matching the search
+        '''
+        return self.pages_fetch('notification', search, ql)
+    
+    @authenticated
+    def delete_notifications(self, uids=[]):
+        '''
+        Delete a notifications list.
+
+        Args:
+            uids (list): A list of notification uids to delete. Example: ["5a463355-ed5c-4207-9530-7f21d32ddc7a", "e016309c-67ce-41b1-94d7-bc39370e5da2"]
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        params = {
+            "s": json.dumps(["OR"] + [["=", "uid", uid] for uid in uids])
+        }
+        resp = requests.delete("{}/api/notification".format(self.server), verify=self.ca, headers=headers, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+    
+    @authenticated
+    def rule(self, name, rule_obj, comment=None):
+        '''
+        Create a rule.
+
+        Args:
+            name (str): Name of the rule.
+            rule_obj (dict): rule information.
+            comment (str): A comment associated with the rule.
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        if not comment:
+            comment = "Created by snooze API"
+        params = {
+            "comment": comment,
+            "name": "[{}] {}".format(self.app_name, name),
+            "modifications": rule_obj.get("modifications", []),
+            "condition": rule_obj.get("condition", []),
+        }
+        resp = requests.post("{}/api/rule".format(self.server), verify=self.ca, headers=headers, json=[params], timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json().get('data')
+    
+    @authenticated
+    def rule_batch(self, obj_ls):
+        '''
+        Create a rule entry.
+
+        Args:
+			rules(dict, list): rules to write
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        if not isinstance(obj_ls, list):
+            obj_ls = [obj_ls]
+        myobj_ls = []
+        for obj in obj_ls:
+            myobj = {
+                "comment": obj.get('comment', "Created by snooze API"),
+                "name": "[{}] {}".format(self.app_name, obj['name']),
+                "modifications": obj.get("modifications", []),
+                "condition": obj.get("condition", []),
+            }
+            myobj_ls.append(myobj)
+        responses = []
+        for myobj_block in get_chunks(myobj_ls, 10):
+            resp = requests.post("{}/api/rule".format(self.server), verify=self.ca, headers=headers, json=myobj_block, timeout=self.timeout)
+            resp.raise_for_status()
+            responses.append(resp.json())
+        return merge_responses(responses).get('data')
+
+    def fetch_rules(self, search=None, ql=None):
+        '''
+        Return a list of rules matching the search.
+        If `search` or `ql` is not precised, the default search will be `[]` (everything).
+
+        Args:
+            search (list): A list representing the search. Example: ["=", "comment", "Created by snooze API"]
+            ql (str): A rule query language string. It will be translated by the server into a
+                search (list). Useful for human interfaces.
+        Returns:
+            list: List of dictionaries representing the rules matching the search
+        '''
+        return self.pages_fetch('rule', search, ql)
+    
+    @authenticated
+    def delete_rules(self, uids=[]):
+        '''
+        Delete a rules list.
+
+        Args:
+            uids (list): A list of rule uids to delete. Example: ["5a463355-ed5c-4207-9530-7f21d32ddc7a", "e016309c-67ce-41b1-94d7-bc39370e5da2"]
+        '''
+        headers = {}
+        headers['Authorization'] = 'JWT ' + self.token
+        headers['Content-type'] = 'application/json'
+        params = {
+            "s": json.dumps(["OR"] + [["=", "uid", uid] for uid in uids])
+        }
+        resp = requests.delete("{}/api/rule".format(self.server), verify=self.ca, headers=headers, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
